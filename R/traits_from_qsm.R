@@ -279,24 +279,34 @@ qsm_volume_distribution = function(qsm, terminus_diam_cm = 4, segment_size=0.5) 
 #' Fit taper equation to QSM
 #'
 #' This function fits a taper equation to trunk sections of a QSM using
-#' Kozak the Model (2002, 2007).
+#' the Kozak Model (2002, 2007).
 #'
-#' $ d(h)/D = a0 (h/H) + a1 (h/H) + a2 (h/H)^2 + a3 (h/H)^3 $
+#' The normalized Kozak equation is:
+#' \deqn{d(h)/D = a_0 + a_1(h/H) + a_2(h/H)^2 + a_3(h/H)^3}
+#'
+#' where \eqn{d(h)} is diameter at height \eqn{h}, \eqn{D} is DBH, and \eqn{H}
+#' is total tree height. Both diameter and height are normalized to create
+#' dimensionless ratios.
 #'
 #' The function groups QSM cylinders into segments of `segment_size` up to
-#' `terminus_diam` which is the maximum diameter at which the taper equation
-#' ends.
+#' `terminus_diam_cm` which is the minimum diameter at which the trunk ends.
+#'
 #' @param qsm a QSM loaded using `[load_qsm()]`.
-#' @param dbh numeric -- required to fit Kozak model, not calculated from QSM, so
-#' as not to conflict with other more accurate means of measurement e.g., `get_DBH'
-#' @param terminus_diam_cm numeric -- the trunk diameter at which is no longer
-#' considered trunk
-#' @param segment_size numeric -- the length of segments that QSM cylinders are
-#' grouped into
+#' @param dbh numeric -- DBH in cm, required to fit Kozak model. Not calculated
+#' from QSM to avoid conflict with other more accurate measurement methods
+#' (e.g., `get_DBH`).
+#' @param terminus_diam_cm numeric -- the minimum trunk diameter (cm) below which
+#' the trunk is no longer considered. Default is 4 cm.
+#' @param segment_size numeric -- the length of segments (m) that QSM cylinders
+#' are grouped into. Default is 0.25 m.
 #' @param plot boolean -- indicates whether model output should be plotted. Plots
 #' are found in the output list as object$plot, regardless of this setting.
+#' @param start_a0 numeric -- starting value for a0 parameter in nls fitting. Default is 1.
+#' @param start_a1 numeric -- starting value for a1 parameter in nls fitting. Default is -1.3.
+#' @param start_a2 numeric -- starting value for a2 parameter in nls fitting. Default is 3.
+#' @param start_a3 numeric -- starting value for a3 parameter in nls fitting. Default is -5.
 #' @importFrom dplyr select filter
-#' @importFrom ggplot2 ggplot aes geom_point theme_bw labs geom_line
+#' @importFrom ggplot2 ggplot aes geom_point theme_bw labs geom_line theme
 #' @importFrom ggplot2 element_blank lims
 #' @importFrom stats coef predict nls cor resid
 #' @return A list with components:
@@ -310,28 +320,77 @@ qsm_volume_distribution = function(qsm, terminus_diam_cm = 4, segment_size=0.5) 
 #' qsm_file = system.file("extdata", "tree_0744_qsm.txt", package='tReeTraits')
 #' qsm = load_qsm(qsm_file)
 #' fit_taper_Kozak(qsm, dbh = 13.8)
+#' 
+#' # For a stubborn tree, try different starting values:
+#' fit_taper_Kozak(qsm, dbh = 13.8, start_a0 = 0.9, start_a1 = -1, start_a2 = 2, start_a3 = -3)
 #' @export
 #'
-fit_taper_Kozak = function(qsm, dbh, terminus_diam_cm = 4, segment_size=0.25, plot=TRUE) {
-  taper = qsm_volume_distribution(qsm, terminus_diam_cm = 2, segment_size=0.25)
+fit_taper_Kozak = function(qsm, dbh, terminus_diam_cm = 4, segment_size = 0.25, plot = TRUE,
+                           start_a0 = 1, start_a1 = -1.3, start_a2 = 3, start_a3 = -5) {
+  # Extract trunk taper data using specified terminus diameter and segment size
+  taper = qsm_volume_distribution(qsm, terminus_diam_cm = terminus_diam_cm, segment_size = segment_size)
   taper = dplyr::select(dplyr::filter(taper, .data$section == 'trunk'), .data$ht_m, .data$diam_cm)
+  
+  # Get total tree height
   H = max(qsm$endZ)
-  # Kozak function
-  d = diam_cm ~ (a0 + a1*(ht_m/H) + a2*(ht_m/H)^2 + a3*(ht_m/H)^3)/dbh
-  f = function(a0, a1, a2, a3, ht_m) (a0 + a1*(ht_m/H) + a2*(ht_m/H)^2 + a3*(ht_m/H)^3)/dbh
-  mod = stats::nls(d, data=taper, start = list(a0=1, a1=-1.3, a2=3, a3=-5))
-  r2 = stats::cor(taper$diam_cm, stats::predict(mod))^2
-  rmse = sqrt(mean(stats::resid(mod)^2))
+  
+  # Create normalized variables
+  taper$d_norm = taper$diam_cm / dbh
+  taper$h_norm = taper$ht_m / H
+  
+  # Fit normalized Kozak equation: d/D = a0 + a1*(h/H) + a2*(h/H)^2 + a3*(h/H)^3
+  d = d_norm ~ a0 + a1 * h_norm + a2 * h_norm^2 + a3 * h_norm^3
+  
+  # Prediction function (returns actual diameter in cm)
+  f = function(a0, a1, a2, a3, ht_m) {
+    h_norm = ht_m / H
+    (a0 + a1 * h_norm + a2 * h_norm^2 + a3 * h_norm^3) * dbh
+  }
+  
+  # Fit model with user-specified starting values
+  mod = tryCatch({
+    stats::nls(d, data = taper, 
+               start = list(a0 = start_a0, a1 = start_a1, 
+                           a2 = start_a2, a3 = start_a3),
+               control = list(maxiter = 100, warnOnly = TRUE))
+  }, error = function(e) {
+    # Fallback: try minpack.lm which is more robust
+    minpack.lm::nlsLM(d, data = taper,
+                      start = list(a0 = start_a0, a1 = start_a1,
+                                  a2 = start_a2, a3 = start_a3))
+  })
+  
+  # Calculate fit statistics using actual diameters
+  pred_diam = stats::predict(mod) * dbh
+  r2 = stats::cor(taper$diam_cm, pred_diam)^2
+  rmse = sqrt(mean((taper$diam_cm - pred_diam)^2))
+  
+  # Store results
   results = as.data.frame(t(stats::coef(mod)))
   results$r2 = r2
   results$rmse = rmse
-  Hs = seq(0,H,by=0.1)
-  modfit = data.frame(ht_m = Hs,diam_cm=f(results$a0, results$a1, results$a2, results$a3, Hs))
-  myPlot = suppressWarnings(ggplot2::ggplot(taper, ggplot2::aes(x=.data$ht_m, y=.data$diam_cm)) + ggplot2::geom_point() +
-    ggplot2::geom_line(data=modfit) + ggplot2::lims(y=c(0,max(modfit$diam_cm)), x=c(0,H)) +
-    ggplot2::theme_bw() + ggplot2::labs(x='Height (m)', y='Diameter (cm)') + theme(panel.grid = ggplot2::element_blank()))
-  if(plot) suppressWarnings(print(myPlot))
-  output = list(data=taper, plot=myPlot, results=results)
+  
+  # Generate fitted curve
+  Hs = seq(0, H, by = 0.1)
+  modfit = data.frame(
+    ht_m = Hs,
+    diam_cm = f(results$a0, results$a1, results$a2, results$a3, Hs)
+  )
+  
+  # Create plot
+  myPlot = suppressWarnings(
+    ggplot2::ggplot(taper, ggplot2::aes(x = .data$ht_m, y = .data$diam_cm)) +
+      ggplot2::geom_point() +
+      ggplot2::geom_line(data = modfit) +
+      ggplot2::lims(y = c(0, max(modfit$diam_cm)), x = c(0, H)) +
+      ggplot2::theme_bw() +
+      ggplot2::labs(x = 'Height (m)', y = 'Diameter (cm)') +
+      ggplot2::theme(panel.grid = ggplot2::element_blank())
+  )
+  
+  if (plot) suppressWarnings(print(myPlot))
+  
+  output = list(data = taper, plot = myPlot, results = results)
   return(output)
 }
 
